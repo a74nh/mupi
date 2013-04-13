@@ -1,0 +1,917 @@
+#!/bin/bash
+##########################################################################
+# smupi
+# v2.0
+#
+# SPARC Solaris MUltiple Platform Interpreter
+#
+# By Alan Hayward, 2006
+#
+# Runs an SPARC Solaris program on any linux box
+#
+# Requires:
+#    binutils multiarch (for objdump and readelf)
+#    hexdump
+#
+# Currently runs:
+#   helloworld ASM
+# 
+#
+USAGE="Usage: smupi [-s] [-d] program";
+#
+##########################################################################
+
+
+cd $(dirname $0)
+source mupi.memaccess >/dev/null;
+source mupi.utils >/dev/null;
+source mupi.elfloader >/dev/null;
+source mupi.main >/dev/null;
+cd - >/dev/null
+
+
+##############################################################################
+##Environment
+
+OBJDUMP=objdump
+BYTESWAP=1;
+
+R_g0=0; R_g1=1; R_g2=2; R_g3=3; R_g4=4; R_g5=5; R_g6=6; R_g7=7;
+R_o0=8; R_o1=9; R_o2=10; R_o3=11; R_o4=12; R_o5=13; R_o6=14; R_o7=15;
+R_l0=16; R_l1=17; R_l2=18; R_l3=19; R_l4=20; R_l5=21; R_l6=22; R_l7=23;
+R_i0=24; R_i1=25; R_i2=26; R_i3=27; R_i4=28; R_i5=29; R_i6=30; R_i7=31;
+R_LAZYOP=32; R_LAZYR=33; R_LAZYS1=34; R_LAZYS2=35;
+R_TOOHIGH=36;
+REG_STACK=$R_o6;
+REG_FRAME=$R_i6;
+
+SYSCALL1=$R_o1;
+SYSCALL2=$R_o2;
+SYSCALL3=$R_o3;
+SYSCALL4=$R_o4;
+SYSCALL5=$R_o5;
+SYSCALL6=$R_o6;
+
+
+REG_VALS_g=(0 0 0 0 0 0 0 0);
+REG_VALS_o=(0 0 0 0 0 0 0 0);
+REG_VALS_l=(0 0 0 0 0 0 0 0);
+REG_VALS_i=(0 0 0 0 0 0 0 0);
+REG_VALS_lazy=(0 0 0 0);
+
+CURRENT_WINDOW=0;
+DELAYSLOT=0;
+ANUL=1;
+NOTANUL=0;
+
+dumpRegs() #none
+{
+  echo "g= ${REG_VALS_g[@]}" >&2;
+  echo "o= ${REG_VALS_o[@]}" >&2;
+  echo "l= ${REG_VALS_l[@]}" >&2;
+  echo "i= ${REG_VALS_i[@]}" >&2;
+  echo "Lazy= ${REG_VALS_lazy[@]}" >&2;
+}
+
+
+##############################################################################
+##Windowing
+
+saveWindow()
+{
+  INS=${REG_VALS_i[@]// /-}
+  INS=${INS// /-}
+  export "REG_VALS_i_w$CURRENT_WINDOW=$INS";
+  
+  LOCALS=${REG_VALS_l[@]// /-}
+  LOCALS=${LOCALS// /-}
+  export "REG_VALS_l_w$CURRENT_WINDOW=$LOCALS";
+
+  REG_VALS_i=( ${REG_VALS_o[@]} );
+
+  REG_VALS_o=( 0 0 0 0 0 0 0 0 );
+  REG_VALS_l=( 0 0 0 0 0 0 0 0 );
+
+  CURRENT_WINDOW=$((CURRENT_WINDOW+1));
+}
+
+
+restoreWindow()
+{
+  if [ 0 -eq $CURRENT_WINDOW ];
+  then
+    errorF "Cannot resotre from window 0";
+  fi;
+  
+  CURRENT_WINDOW=$((CURRENT_WINDOW-1));
+  
+  REG_VALS_o=( ${REG_VALS_i[@]} );
+
+  INS_STORE="REG_VALS_i_w$CURRENT_WINDOW";
+  INS=${!INS_STORE};
+  REG_VALS_i=( ${INS//-/ } );
+
+  LOCALS_STORE="REG_VALS_l_w$CURRENT_WINDOW";
+  LOCALS=${!LOCALS_STORE};
+  REG_VALS_l=( ${LOCALS//-/ } );
+
+}
+
+##############################################################################
+##Branching
+
+branch() #anul, bool, param
+{
+  ANULBIT=$1;
+  TRUTH=$2;
+  PAR=$3;
+  
+  if [ $TRUTH -eq 1 ];
+  then
+    setDelaySlot $(getV "$PAR");    
+  else
+    if [ $ANULBIT -eq $ANUL ]; #AMUL SET
+    then
+      setNextInstruction $((NEXTINSTRUCTION+4));
+    fi;
+  fi;
+}
+
+
+##############################################################################
+##Register Functions
+
+
+getRegIndex()  #regstring
+{
+  #return register index
+  IVAL=${1:2:1};
+  
+  case ${1:1:1} in
+  "g") echo $IVAL; return;;
+  "o") echo $(($IVAL+R_o0)); return;;
+  "l") echo $(($IVAL+R_l0)); return;;
+  "i") echo $(($IVAL+R_i0)); return;;
+  "s") echo $REG_STACK; return;;  #sp!
+  "f") ;;
+  *) error "getRegIndex: Unsupported Reg: $1";;
+  esac;
+  
+  # starts with f
+  case ${1:2:1} in
+  "p") echo $REG_FRAME;;  #fp!
+  *) error "getRegIndex: Unsupported Reg: $1";;
+  esac;
+}
+
+
+getRegVal() #regIndex
+{
+  #return register value
+  INDEX=$1;
+
+  if [ $INDEX -lt $R_o0 ];
+  then
+    echo ${REG_VALS_g[$INDEX]};
+   
+  elif [ $INDEX -lt $R_l0 ];
+  then
+    echo ${REG_VALS_o[$((INDEX-R_o0))]};
+
+  elif [ $INDEX -lt $R_i0 ];
+  then
+    echo ${REG_VALS_l[$((INDEX-R_l0))]};
+
+  elif [ $INDEX -lt $R_LAZYOP ];
+  then
+    echo ${REG_VALS_i[$((INDEX-R_i0))]};
+
+  elif [ $INDEX -lt $R_TOOHIGH ];
+  then
+    echo ${REG_VALS_lazy[$((INDEX-R_LAZYOP))]};
+
+  else
+    error "getRegVal: Unsupported Reg: $INDEX";
+    echo 0;
+  fi;
+}
+
+getRegSize() #regIndex
+{
+  error "getRegVal: Surely I am always 32bits ??";
+  echo 4;
+}
+
+
+setRegVal() #regIndex, value
+{
+  INDEX=$1;
+  VAL=$2;
+  
+  if [ $INDEX -lt $R_o0 ];
+  then
+    REG_VALS_g[$INDEX]=$VAL;
+   
+  elif [ $INDEX -lt $R_l0 ];
+  then
+    REG_VALS_o[$((INDEX-R_o0))]=$VAL;
+
+  elif [ $INDEX -lt $R_i0 ];
+  then
+    REG_VALS_l[$((INDEX-R_l0))]=$VAL;
+
+  elif [ $INDEX -lt $R_LAZYOP ];
+  then
+    REG_VALS_i[$((INDEX-R_i0))]=$VAL;
+
+  elif [ $INDEX -lt $R_TOOHIGH ];
+  then
+    REG_VALS_lazy[$((INDEX-R_LAZYOP))]=$VAL;
+
+  else
+    error "setRegVal: Unsupported Reg: $INDEX";
+  fi;
+}
+
+
+##############################################################################
+##get/set Parameters
+##Parameters are strings like "esp" "(eax)" "0x345677"
+
+getV() #parameter
+{
+  #Note: will not load from a memory address
+  TOGET="$1";
+  
+  case $TOGET in
+  
+  "%hi"*) LEN=${#TOGET};
+          #No need to <<10 ??
+          VAL=${TOGET:4:LEN-5};;
+  
+  #Register
+  "%"*) REG=$(getRegIndex "$TOGET");
+        VAL=$(getRegVal $REG);;
+  
+ 
+  #Call location (address)
+  "0x"*) VAL=$(echo $TOGET);;
+ 
+  #Number
+  0*|1*|2*|3*|4*|5*|6*|7*|8*|9*|-*) VAL=$(echo 0x$TOGET);;
+
+  #Allowing null values...
+  "") VAL=0;;
+  
+  #Other
+  *) error "getV: Unsupported: $TOGET";
+     VAL=0;;
+  
+  esac
+  echo $VAL;
+  
+}
+
+loadV() #parameter, [size]
+{
+  #Note: might load from a memory address
+  local TOGET="$1";
+  local SIZE=${2:-4}; #defaults to 4
+  local VAL=0;
+
+  case $TOGET in
+  
+  #Register
+  "%"*) local REG=$(getRegIndex "$TOGET");
+        VAL=$(getRegVal $REG);;
+  #Other
+  *) error "loadV: Unsupported: $TOGET";
+     VAL=0;;
+  
+  esac
+  echo $VAL;
+  
+}
+
+setV() #parameter,value,size
+{
+  #Note: will not store to a memory address
+  TOSET="$1";
+  VAL=$2;
+  SIZE=$3
+  #echo "setV: Setting: $TOSET $VAL $SIZE";
+  
+  case $TOSET in
+  
+  #Register
+  "%"*) REG=$(getRegIndex $TOSET);
+        setRegVal $REG $VAL;;
+
+  #blank entry
+  0) ;;
+
+  #Other
+  *) error "setV: Unsupported: $TOSET $VAL $SIZE";;
+  
+  esac
+}
+
+storeV() #parameter,value,size
+{
+  #Note: might store to a memory address
+  TOSET="$1";
+  VAL=$2;
+  SIZE=$3
+  #echo "storeV: Setting: $TOSET $VAL $SIZE";
+  
+  case $TOSET in
+  
+  #Number
+  0*|1*|2*|3*|4*|5*|6*|7*|8*|9*|-*) setValueToMemory $TOSET $SIZE $VAL;;
+
+  #Other
+  *) error "storeV: Unsupported: $TOSET $VAL $SIZE";;
+  
+  esac
+}
+
+getVSize() #parameterSrc, parameterDest
+{
+  errorF "getVSize: not done any";
+
+  #Returns size
+  #Figures out what size the operation is
+  local SRC="$1";
+  local DEST="$2";
+  local SIZE=4;
+  
+  case $DEST in
+  "%"*) #error "REGIS?TER DEST";
+    local REG=$(getRegIndex "$DEST");
+    local SIZETEMP=$(getRegSize $REG);
+    if [ $SIZETEMP -lt 4 ];
+    then
+      SIZE=$SIZETEMP;
+    fi;;
+  esac
+  
+  case $SRC in
+  "%"*)   #error "REGIS?TER SRC";
+    local REG=$(getRegIndex "$SRC");
+    local SIZETEMP=$(getRegSize $REG);
+    if [ $SIZETEMP -lt $SIZE ];
+    then
+      SIZE=$SIZETEMP;
+    fi;;
+  esac
+
+  echo $SIZE;
+}
+
+
+
+
+##############################################################################
+##Lazy Flagging
+
+setLazyFlags() # Opcode, Res, src1, src2
+{
+  #Currently only sets flags for sub (?)
+  
+  setRegVal $R_LAZYOP $1;
+  setRegVal $R_LAZYR $2;
+  setRegVal $R_LAZYS1 $3;
+  setRegVal $R_LAZYS2 $4;
+}
+
+getLazyiccZ()
+{
+  LAZY=0;
+  R=$(getRegVal $R_LAZYR);
+  OP=$(getRegVal $R_LAZYOP);
+  
+  case "$OP" in
+    "sub") if [ "$R" -eq 0 ]
+           then
+             LAZY=1;
+           fi;;
+    "or") error "getLazyiccZ: or : fill me in!";
+          LAZY=1;;
+   *) errorF "Lazy Op $(getRegVal $R_LAZYOP) not done yet";;
+  esac;
+}
+
+getLazyiccC()
+{
+  LAZY=0;
+  R=$(getRegVal $R_LAZYR);
+  OP=$(getRegVal $R_LAZYOP);
+ 
+  case "$OP" in
+    "sub") if [ "$R" -lt 0 ]
+           then
+             LAZY=1;
+           fi;;
+           #     //C = (~A & B) | (RES & (~A | B))
+
+    *) errorF "Lazy Op $(getRegVal $R_LAZYOP) not done yet";;
+  esac;
+}
+
+##############################################################################
+##System calls
+
+
+callSolarisSyscall() #none
+{
+  CALL=$(getRegVal $R_g1);
+  local SYSCALL_RESULT=0;
+  
+  case $((CALL)) in
+  
+  #exit
+  1) STRACE exit 1 "=0\n";
+     exitTranslator;;
+  
+  #write
+  4) STRACE write 3;
+     getValuesFromMemoryAsAscii $(getRegVal $R_o1) $(getRegVal $R_o2);;
+
+  #Unknown
+  *) errorF "Unknown Solaris syscall $CALL($(getRegVal $R_o0),$(getRegVal $R_o1),$(getRegVal $R_o2),$(getRegVal $R_o3),$(getRegVal $R_o4),$(getRegVal $R_o5) )";;
+
+  esac
+
+  #Set the result;
+  setRegVal $R_EAX $SYSCALL_RESULT;
+  STRACERESULT $SYSCALL_RESULT;
+}
+
+callLinuxSyscall() #none
+{
+  CALL=$(getRegVal $R_g1);
+  local SYSCALL_RESULT=0;
+  
+  case $((CALL)) in
+  
+  #exit
+  1) STRACE exit 1 "=0\n";
+     exitTranslator;;
+  
+  #write
+  #4) STRACE write 3;
+  #   getValuesFromMemoryAsAscii $(getRegVal $R_o1) $(getRegVal $R_o2);;
+
+  #open
+  5) STRACE open 3;;
+     #getValuesFromMemoryAsAscii $(getRegVal $R_o1) 5;;
+   
+  #getuid
+  24) STRACE getuid 0;
+      SYSCALL_RESULT=$UID;;
+  
+  #geteuid
+  49) STRACE geteuid 0;
+      SYSCALL_RESULT=$EUID;;
+  
+  #fstat64
+  63) STRACE fstat64 3;; #Do nothing for now...
+
+  #fcntl
+  155) STRACE fcntl 3;; #Do nothing for now...
+
+  #Unknown
+  *) errorF "Unknown Linux syscall $CALL($(getRegVal $R_o0),$(getRegVal $R_o1),$(getRegVal $R_o2),$(getRegVal $R_o3),$(getRegVal $R_o4),$(getRegVal $R_o5) )";;
+
+  esac
+
+  #Set the result;
+  setRegVal $R_o0 $SYSCALL_RESULT;
+  STRACERESULT $SYSCALL_RESULT;
+}
+
+
+##############################################################################
+##Perform Instruction
+
+Opcode_()
+{
+  error "Unimplemented in objdump: $ADDRESS";
+}
+
+
+Opcode_add()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 + VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_b()
+{
+  #branch always ?
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+    branch $ANUL 1 $PARAM_SRC2;
+  else
+    branch $ANUL 1 $PARAM_SRC;
+  fi;
+}
+
+Opcode_be()
+{
+  getLazyiccZ;
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+    branch $ANUL $LAZY $PARAM_SRC2;
+  else
+    branch $ANUL $LAZY $PARAM_SRC;
+  fi;
+  
+}
+
+Opcode_bne()
+{
+  getLazyiccZ;
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+    branch $ANUL $((!LAZY)) $PARAM_SRC2;
+  else
+    branch $ANUL $((!LAZY)) $PARAM_SRC;
+  fi;
+}
+
+Opcode_bcc()
+{
+  getLazyiccC;
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+    branch $ANUL $((!LAZY)) $PARAM_SRC2;
+  else
+    branch $ANUL $((!LAZY)) $PARAM_SRC;
+  fi;
+}
+
+Opcode_bcs()
+{
+  getLazyiccC;
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+    branch $ANUL $LAZY $PARAM_SRC2;
+  else
+    branch $ANUL $LAZY $PARAM_SRC;
+  fi;
+}
+
+Opcode_bleu()
+{
+  getLazyiccZ;
+  LAZYZ=$LAZY;
+  
+  getLazyiccC;
+  LAZYC=$LAZY;
+  
+  TRUE=$(($LAZYC|$LAZYZ));
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+      branch $ANUL $TRUE $PARAM_SRC2;
+  else
+      branch $ANUL $TRUE $PARAM_SRC;
+  fi;
+}
+
+Opcode_bg()
+{
+  getLazyiccZ;
+  LAZYZ=$LAZY;
+  
+  getLazyiccN;
+  LAZYN=$LAZY;
+  
+  getLazyiccV;
+  LAZYV=$LAZY;
+  
+  TRUE=$((!($LAZYZ|($LAZYN!=$LAZYV))));
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+      branch $ANUL $TRUE $PARAM_SRC2;
+  else
+      branch $ANUL $TRUE $PARAM_SRC;
+  fi;
+}
+
+Opcode_bge()
+{
+  getLazyiccN;
+  LAZYN=$LAZY;
+  
+  getLazyiccV;
+  LAZYV=$LAZY;
+  
+  TRUE=$((!($LAZYN!=$LAZYV)));
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+      branch $ANUL $TRUE $PARAM_SRC2;
+  else
+      branch $ANUL $TRUE $PARAM_SRC;
+  fi;
+}
+
+Opcode_bgu()
+{
+  getLazyiccZ;
+  LAZYZ=$LAZY;
+  
+  getLazyiccC;
+  LAZYC=$LAZY;
+  
+  TRUE=$((!($LAZYC|$LAZYZ)));
+  
+  if [ "$PARAM_SRC" = "a" ];
+  then
+      branch $ANUL $TRUE $PARAM_SRC2;
+  else
+      branch $ANUL $TRUE $PARAM_SRC;
+  fi;
+}
+
+Opcode_call()
+{
+  setDelaySlot $(getV "$PARAM_SRC");
+  setRegVal $R_o7 $ADDRESS;
+}
+
+
+Opcode_clr()
+{
+  setV "$PARAM_DEST" 0 4;
+}
+
+
+Opcode_cmp()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 - VAL_2));
+  setLazyFlags "sub" $VAL_RES $VAL_1 $VAL_2;
+}
+
+
+Opcode_ld()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  getValuesFromMemory $((VAL_1+VAL_2)) 4;
+  VAL_RES=$MEMORYVALUE
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+
+Opcode_mov()
+{
+  setV "$PARAM_DEST" $(getV "$PARAM_SRC" 4) 4;
+}
+
+
+Opcode_nop()
+{
+  return;
+}
+
+
+Opcode_or()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 | VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_orcc()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 | VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+  setLazyFlags "or" $VAL_RES $VAL_1 $VAL_2;
+}
+
+
+Opcode_restore()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 + VAL_2));
+
+  restoreWindow;
+
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+
+Opcode_ret()
+{
+  VAL=$(getRegVal $R_i7);
+  setDelaySlot $((VAL+8));
+}
+
+
+Opcode_retl()
+{
+  VAL=$(getRegVal $R_o7);
+  setDelaySlot $((VAL+8));
+}
+
+
+Opcode_save()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 + VAL_2));
+
+  saveWindow;
+
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+
+Opcode_sethi()
+{
+  ##The hi bit is expanded in the getV. Otherwise same as mov
+  setV "$PARAM_DEST" $(getV "$PARAM_SRC" 4) 4;
+}
+
+
+Opcode_sub()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 - VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+
+Opcode_subx()
+{
+  #possibly incorrect
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 - VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+
+Opcode_sll()
+{
+  VAL_1=$(getV "$PARAM_SRC");
+  VAL_2=$(getV "$PARAM_SRC2");
+  VAL_RES=$((VAL_1 << VAL_2));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_st()
+{
+  ADDR_1=$(getV "$PARAM_SRC");
+  ADDR_2=$(getV "$PARAM_SRC2");
+  ADDR=$((ADDR_1 + ADDR_2));
+  VAL=$(getV "$PARAM_DEST");
+  storeV $ADDR $VAL 4;
+}
+
+
+Opcode_ta()
+{  
+  if [ "$PARAM_DEST" == 8 ]
+  then
+    callSolarisSyscall;
+  elif [ "$PARAM_DEST" == "0x10" ]
+  then
+    callLinuxSyscall;
+  else
+    error "Opcode_int: Unknown trap parameter "$PARAM_DEST"";
+  fi;
+}
+
+
+setDelaySlot() #address
+{
+  DELAYSLOT=$(($1+0));
+}
+
+
+performInstruction() #none
+{
+  VAL_RES=;
+
+  if [ "$DELAYSLOT" -ne 0 ];
+  then
+    setNextInstruction $DELAYSLOT;
+    setDelaySlot 0;
+  fi;
+
+  Opcode_$OPCODE;
+  
+  if [ $? -eq 127 ];
+  then
+    errorF "Error in Opcode_$OPCODE.";
+  fi;
+}
+
+
+##############################################################################
+##Disassemble Instruction
+
+disassemble() #none
+{
+  local INSTRUCVAR=INSTRUCTION_$ADDRESS;
+  local INSTRUCVAL=${!INSTRUCVAR};
+
+  if [ "$INSTRUCVAL" ];
+  then
+    #echo "disassemble: Using Cached Instruction: $INSTRUCVAL";
+    export $INSTRUCVAL;
+  else
+    LENGTH=4; #nice sparc :)
+
+    LIST=( $($OBJDUMP -d --start-address=$ADDRESS --stop-address=$((ADDRESS+1)) $EXE | awk -F"\t" '{ if($3)print $3;}' | tr , " ") );
+    #echo "Objdump Size ${#LIST[@]} :${LIST[@]}";
+
+    #Opcode
+    OPCODE=${LIST[0]};
+
+    case ${#LIST[@]} in
+    
+    0) ;;
+    
+    1) PARAM_SRC=0;
+       PARAM_SRC2=0;
+       PARAM_DEST=0;;
+
+    2) PARAM_SRC=0;
+       PARAM_SRC2=0;
+       PARAM_DEST=${LIST[1]};;
+
+    3) PARAM_SRC=${LIST[1]};
+       PARAM_SRC2=0;
+       PARAM_DEST=${LIST[2]};;
+
+    4) PARAM_SRC=${LIST[1]};
+       PARAM_SRC2=${LIST[2]};
+       PARAM_DEST=${LIST[3]};;
+
+    5)  if [ ${LIST[1]} = "[" -a ${LIST[3]} = "]" ];
+        then
+          PARAM_SRC=${LIST[2]};
+          PARAM_SRC2=0;
+          PARAM_DEST=${LIST[4]};
+        elif [ ${LIST[2]} = "[" -a ${LIST[4]} = "]" ];
+        then
+          #eg: st  %o1, [ %o2 ]
+          PARAM_SRC=${LIST[3]};
+          PARAM_SRC2=0;
+          PARAM_DEST=${LIST[1]};
+        else
+          errorF "disassemble: Unsupported param list type ${#LIST[@]} : ${LIST[@]}";
+        fi;;
+    
+    7)  if [ ${LIST[1]} = "[" -a  ${LIST[3]} = "+"  -a  ${LIST[5]} = "]"  ];
+        then
+          #eg: ld [ %o0 + 0x2b8 ], %o1
+          PARAM_SRC=${LIST[2]};
+          PARAM_SRC2=${LIST[4]};
+          PARAM_DEST=${LIST[6]};
+        elif [ ${LIST[2]} = "[" -a  ${LIST[4]} = "+"  -a  ${LIST[6]} = "]"  ];
+        then
+          #eg: st  %o1, [ %o0 + 0x2b8 ]
+          PARAM_SRC=${LIST[3]};
+          PARAM_SRC2=${LIST[5]};
+          PARAM_DEST=${LIST[1]};
+        else
+          errorF "disassemble: Unsupported param list type ${#LIST[@]} : ${LIST[@]}";
+        fi;;
+
+    *) errorF "disassemble: Unsupported param list size ${#LIST[@]} : ${LIST[@]}";;
+
+    esac;
+
+    #Cache the instruction for future use
+    export "INSTRUCTION_$ADDRESS=OPCODE=$OPCODE  PARAM_SRC=$PARAM_SRC PARAM_SRC2=$PARAM_SRC2 PARAM_DEST=$PARAM_DEST LENGTH=$LENGTH";
+    #foo=INSTRUCTION_$ADDRESS; echo ${!foo}
+    NUMBER_DISASSEMBLED=$((NUMBER_DISASSEMBLED+1));
+  fi;
+}
+
+
+##############################################################################
+##GO!
+
+run $@;

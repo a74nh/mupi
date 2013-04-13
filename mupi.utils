@@ -1,0 +1,131 @@
+#!/bin/bash
+##########################################################################
+#
+# mupi util functions
+#
+# By Alan Hayward, 2006
+#
+# Internal mpui functions. Do not run directly
+#
+##########################################################################
+
+echo "Internal mpui functions. Do not run directly";
+
+
+SHIFT=(0 8 16 32);
+CHOP=(0 0xff 0xffff 0xffffffff);
+
+##############################################################################
+##exit Points
+
+dumpInstruction() #none
+{
+  echo "$ADDRESS: opcode=$OPCODE, Src=$PARAM_SRC, Src2=$PARAM_SRC2 Dest=$PARAM_DEST" >&2;
+  
+  $OBJDUMP -d --start-address=$ADDRESS --stop-address=$((ADDRESS+1)) $EXE | awk -F"\t" '{ if($3)print $0;}';
+
+}
+
+debug() #String...
+{
+  #Debug message
+  echo "Debug: "$@ >&2;
+  dumpInstruction;
+}
+
+exitMessage()
+{
+  if [ $DEBUG ];
+  then
+    echo;
+    echo "Number of instructions disassembled =$NUMBER_DISASSEMBLED" >&2;
+    echo "Number of instructions executed =$NUMBER_EXECUTED" >&2;
+  fi;
+}
+
+error() #String...
+{
+  #Non Fatal Error
+  echo "Error: "$@ >&2;
+  #dumpInstruction;
+  #dumpRegs;
+  #exitMessage;
+}
+
+errorF() #String...
+{
+  #Fatal Error
+  echo "Fatal Error: "$@ >&2;
+  dumpInstruction;
+  dumpRegs;
+  exitMessage;
+  kill -9 $$;
+
+}
+
+exitTranslator() #None
+{
+  exitMessage;
+  unset RUNNING; 
+  
+  exit;  #Note: exit won't work for $(...) stuff
+}
+
+
+##############################################################################
+##SignedInt
+
+signedInt() #value
+{
+  #returns the int as a signed value
+  #(eg 0xffffffff is -1)
+  
+  local VAL=$1;
+  
+  if [ $((VAL)) -ge $((0x7fffffff)) ];
+  then
+    echo $(((0xffffffff-VAL+1)*-1));
+  else
+    echo $VAL;
+  fi;
+}
+
+
+##############################################################################
+##ascii
+
+#must be a better way of doing this?
+ASCII=( 0 0 0 0 0 0 0 0\
+        0 0 "\n" 0 0 0 0 0\
+        0 0 0 0 0 0 0 0\
+        0 0 0 0 0 0 0 0\
+        ' ' "!" 0 0 0 0 0 0 \
+        0 0 0 0 "," 0 0 0\
+        0 1 2 3 4 5 6 7 \
+        8 9 0 0 0 0 0 0 \
+        "@" "A" "B" "C" "D" "E" "F" "G" \
+        "H" "I" "J" "K" "L" "M" "N" "O" \
+        "P" "Q" "R" "S" "T" "U" "V" "W" \
+        "X" "Y" "Z" 0   0   0   0   0   \
+        0   "a" "b" "c" "d" "e" "f" "g" \
+        "h" "i" "j" "k" "l" "m" "n" "o" \
+        "p" "q" "r" "s" "t" "u" "v" "w" \
+        "x" "y" "z" );
+    
+getascii() #hexchar,...
+{
+  #echo "TOASCII $@ ">&2;
+  while [ $1 ];
+  do
+    x=$1;
+    if [ $((x)) -gt 0 ];
+    then
+      printf "${ASCII[$x]}";
+    fi;
+    if [ $((x)) -eq 10 ];
+    then
+      return;
+    fi;
+    shift;
+  done;
+}

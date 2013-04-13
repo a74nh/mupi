@@ -1,0 +1,126 @@
+#!/bin/bash
+##########################################################################
+#
+# mupi main functions
+#
+# By Alan Hayward, 2006
+#
+# Internal mpui functions. Do not run directly
+#
+##########################################################################
+
+echo "Internal mpui functions. Do not run directly";
+
+
+##############################################################################
+##Deal with command line
+
+commandLine()
+{
+  while getopts ds? line
+  do
+       case $line in
+       d) DEBUG=1;;
+       s) STRACE=1;;
+       ?) echo $USAGE; exit;;
+       esac
+  done;
+  shift `expr $OPTIND - 1`;
+
+  EXE=${1:?$USAGE};
+  if [ ! -x $EXE ];
+  then
+      echo $USAGE;
+      exit;
+  fi;
+}
+
+##############################################################################
+##System calls
+
+initStrace()
+{
+  #Stracing support
+  if [ $STRACE ];
+  then
+  STRACE() #syscallname, numberParams, string...
+  {
+    local NAME=$1;
+    local NUMBER=$2;
+    shift; shift;
+    printf "Strace::$NAME(" >&2;
+    case $NUMBER in
+    6) printf "$(getRegVal $SYSCALL1),$(getRegVal $SYSCALL2),$(getRegVal $SYSCALL3),$(getRegVal $SYSCALL4),$(getRegVal $SYSCALL5),$(getRegVal $SYSCALL6)" >&2;;
+    5) printf "$(getRegVal $SYSCALL1),$(getRegVal $SYSCALL2),$(getRegVal $SYSCALL3),$(getRegVal $SYSCALL4),$(getRegVal $SYSCALL5)" >&2;;
+    4) printf "$(getRegVal $SYSCALL1),$(getRegVal $SYSCALL2),$(getRegVal $SYSCALL3),$(getRegVal $SYSCALL4)" >&2;;
+    3) printf "$(getRegVal $SYSCALL1),$(getRegVal $SYSCALL2),$(getRegVal $SYSCALL3)" >&2;;
+    2) printf "$(getRegVal $SYSCALL1),$(getRegVal $SYSCALL2)" >&2;;
+    1) printf "$(getRegVal $SYSCALL1)" >&2;;
+    esac
+    printf ")$@" >&2;
+  }
+  STRACERESULT() #String...
+  {
+    printf " =$@\n" >&2;
+  }
+  else
+  STRACE() #syscallname, number params, string...
+  {
+    return;
+  }
+  STRACERESULT() #String...
+  {
+    return;
+  }
+  fi;
+}
+
+
+##############################################################################
+##setNextInstruction
+
+setNextInstruction() #address
+{
+  NEXTINSTRUCTION=$1;
+}
+
+
+##############################################################################
+##Main Loop
+
+run()
+{
+  commandLine $@;
+  initStrace;
+
+  NUMBER_EXECUTED=0;
+  NUMBER_DISASSEMBLED=0;
+
+  ADDRESS=$(getStartAddress);
+  loadInitialMemoryAddresses;
+  createStack;
+
+  RUNNING=1;
+
+  while [ $RUNNING ];
+  do
+
+    disassemble;
+    setNextInstruction $((ADDRESS+LENGTH));
+
+    if [ $DEBUG ];
+    then
+      echo >&2;
+      dumpRegs;
+      echo >&2;
+      dumpInstruction;
+      NUMBER_EXECUTED=$((NUMBER_EXECUTED+1));
+    fi;
+
+    performInstruction;
+
+    ADDRESS=$NEXTINSTRUCTION;
+
+  done;
+}
+

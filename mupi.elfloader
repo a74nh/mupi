@@ -1,0 +1,121 @@
+#!/bin/bash
+##########################################################################
+#
+# mupi elf loader functions
+#
+# By Alan Hayward, 2006
+#
+# Internal xmpui functions. Do not run directly
+#
+##########################################################################
+
+echo "Internal mpui functions. Do not run directly";
+
+
+##############################################################################
+##Instruction Addresses
+
+getStartAddress() #none
+{
+  echo 0x$(readelf -S $EXE | grep .text | awk '{print $5}');
+}
+
+
+loadInitialMemoryAddresses() #none
+{
+  #This is essentially an Elf File Loader
+
+  local OLDIFS="$IFS";
+  IFS="!"
+  local FOO;
+  #We want both NOBITS and PROGBITS
+  FOO=($(readelf -S $EXE | grep BITS| awk -v exe=$EXE -v type=0 '{ if(type==1) exit;
+                                                         if($3=="NOBITS" || $4=="NOBITS")
+                                                          type=1;
+                                                         if($1=="[" && $7!=0 && $5!=0 )
+                                                          printf "addMemoryLocation 0x"$5" 0x"$7" "type" "exe" 0x"$6" !"; 
+                                                         if($1!="[" && $6!=0 && $4!=0 )
+                                                          printf "addMemoryLocation 0x"$4" 0x"$6" "type" "exe" 0x"$5" !";
+                                                       }'));
+  IFS="$OLDIFS";
+
+  local COUNT=0;
+  while [ $COUNT -lt ${#FOO[@]} ];
+  do  
+   #echo ${FOO[$COUNT]};
+   ${FOO[$COUNT]};
+   COUNT=$((COUNT+1));
+  done;
+  
+  #Set up initial brk address
+  #(Don't think this is correct)
+  BRKVAL=$(( $(readelf -S $EXE | grep NOBITS| tail -n1 | awk '{ if($1=="[" && $7!=0 && $5!=0 )
+                                                       print "0x"$5"+0x"$7; 
+                                                     if($1!="[" && $6!=0 && $4!=0 )
+                                                       print "0x"$4"+0x"$6; 
+                                                   }')  ));
+
+  INITIAL_BRKVAL=$BRKVAL
+  addMemoryLocation $INITIAL_BRKVAL 0 $T_MEM x 0;
+}
+
+
+createStack() #none
+{
+  local STACKTOP=0x7c000000;
+  local STACKLEN=0x10000;
+  addMemoryLocation $((STACKTOP-STACKLEN)) $STACKLEN $T_MEM x 0;
+
+  local STACK=$STACKTOP;
+
+  #Push full argv[X...to...1] strings.
+  #Remember base addresses
+  #none, for now..
+
+  #Push full argv[0] string and remember base address
+  STACK=$((STACK-${#EXE}));
+  STACK=$((STACK&0xfffffffc));
+  local ARGV0_LOC=$STACK;
+  setValuesToMemoryAsAscii $ARGV0_LOC $EXE;
+
+  #push value: auxilary ID and value [AT_NULL, 0]
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 0;
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 0;
+
+  #push value: auxilary ID and value [X...to...0]
+  #none, for now..
+
+  #push value: 0
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 0;
+
+  #push value: pointer to envvp[X..to...0] 
+  #none, for now..
+
+  #push value: 0
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 0;
+
+  #push value: pointer to argv[X..to...1] 
+  #none, for now..
+   
+  #push value: pointer to argv[0] 
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 $ARGV0_LOC;
+   
+  #push value: argc
+  STACK=$((STACK-4));
+  setValueToMemory $STACK 4 0x1;
+ 
+  #push value: ten loads of blanks...gah...
+  for (( i=0; i < 16 ; i++ ))
+  do
+    STACK=$((STACK-4));
+    setValueToMemory $STACK 4 0x0;
+  done;
+  
+  #Set stack Reg  
+  setRegVal $REG_STACK $STACK;
+}

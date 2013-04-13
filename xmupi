@@ -1,0 +1,1189 @@
+#!/bin/bash
+##########################################################################
+# xmupi
+# v2.0
+#
+# X86 MUltiple Platform Interpreter
+#
+# By Alan Hayward, 2006
+#
+# Runs an X86 linux program on any linux box
+#
+# Requires:
+#    binutils multiarch (for objdump and readelf)
+#    hexdump
+#
+# Runs:
+#   helloworld ASM
+#   greenbottles ASM
+# 
+#
+USAGE="Usage: xmupi program";
+#
+##########################################################################
+
+cd $(dirname $0)
+source mupi.memaccess >/dev/null;
+source mupi.utils >/dev/null;
+source mupi.elfloader >/dev/null;
+source mupi.main >/dev/null;
+cd - >/dev/null
+
+
+##############################################################################
+##Environment
+
+OBJDUMP=objdump
+BYTESWAP=0;
+
+R_EAX=0; R_ECX=1; R_EDX=2; R_EBX=3;
+R_ESP=4; R_EBP=5; R_ESI=6; R_EDI=7;
+
+R_AL=8; R_CL=9; R_DL=10; R_BL=11;
+
+R_AH=12; R_CH=13; R_DH=14; R_BH=15;
+
+R_AX=16; R_CX=17; R_DX=18; R_BX=19;
+R_SP=20; R_BP=21; R_SI=22; R_DI=23;
+
+R_LAZYOP=24; R_LAZYR=25; R_LAZYD=26; R_LAZYS=27;
+
+R_EIZ=28;
+
+REG_NAMES=("%eax" "%ecx" "%edx" "%ebx" "%esp" "%ebp" "%esi" "%edi" \
+           "%al" "%cl" "%dl" "%bl" \
+           "%ah" "%ch" "%dh" "%bh" \
+           "%ax" "%cx" "%dx" "%bx" \
+           "%sp" "%bp" "%si" "%di" \
+           "LOp" "LR" "LD" "LS" \
+	   "eiz" );
+REG_VALS=(0 0 0 0 0 0 0 0 0 0 0);
+
+REG_STACK=$R_ESP;
+
+SYSCALL1=$R_EBX;
+SYSCALL2=$R_ECX;
+SYSCALL3=$R_EDX;
+SYSCALL4=$R_ESI;
+SYSCALL5=$R_EDI;
+SYSCALL6=$R_EBP;
+
+dumpRegs() #none
+{
+  echo "\
+  ${REG_NAMES[0]}=${REG_VALS[0]}\
+  ${REG_NAMES[1]}=${REG_VALS[1]}\
+  ${REG_NAMES[2]}=${REG_VALS[2]}\
+  ${REG_NAMES[3]}=${REG_VALS[3]}\
+  ${REG_NAMES[4]}=${REG_VALS[4]}\
+  ${REG_NAMES[5]}=${REG_VALS[5]}\
+  ${REG_NAMES[6]}=${REG_VALS[6]}\
+  ${REG_NAMES[7]}=${REG_VALS[7]}\
+  ${REG_NAMES[24]}=${REG_VALS[24]}\
+  ${REG_NAMES[25]}=${REG_VALS[25]}\
+  ${REG_NAMES[26]}=${REG_VALS[26]}\
+  ${REG_NAMES[27]}=${REG_VALS[27]}" >&2;
+  #echo ${REG_VALS[@]};
+}
+
+
+##############################################################################
+##Disassemble Instruction
+
+disassemble() #none
+{
+  local INSTRUCVAR=INSTRUCTION_$ADDRESS;
+  local INSTRUCVAL=${!INSTRUCVAR};
+
+  if [ "$INSTRUCVAL" ];
+  then
+    #echo "disassemble: Using Cached Instruction: $INSTRUCVAL";
+    export $INSTRUCVAL;
+  else
+
+    LIST=( $($OBJDUMP -d --start-address=$ADDRESS --stop-address=$((ADDRESS+1)) $EXE | awk -F"\t" '{ if($3){len=split($2,ar," ");print len" "$3;}}') );
+    #echo "Objdump Size ${#LIST[@]} :${LIST[@]}";
+
+    #Bah. We have 00 00 00
+    if [ ! $LIST ];
+    then
+      #Is this a fudge? will it always be 3 long?
+      ADDRESS=$((ADDRESS+3));
+      disassemble;
+    fi;
+    
+    #Instruction length;
+    LENGTH=${LIST[0]};
+
+    #Opcode
+    OPCODE=${LIST[1]};
+
+    #Note: A label name would appear as ${LIST[3]}
+
+    if [ ${#LIST[@]} -eq 4 -a ${LIST[1]:0:3} == "rep" ];
+    then
+      #"rep scas" type thing      
+      OPCODE="$OPCODE${LIST[2]}";
+
+      #Parameters
+      OLDIFS=$IFS
+      IFS=",";
+      PARAMLIST=( ${LIST[3]} );
+      IFS=$OLDIFS;
+    else
+      #Parameters
+      OLDIFS=$IFS
+      IFS=",";
+      PARAMLIST=( ${LIST[2]} );
+      IFS=$OLDIFS;
+    fi;
+    
+    case ${#PARAMLIST[@]} in
+
+    0|1|2) PARAM_SRC=${PARAMLIST[0]};
+           PARAM_DEST=${PARAMLIST[1]};;
+    
+    4) #ModRM
+       local len3=$((${#PARAMLIST[3]}-1));
+       if [ ${PARAMLIST[3]:$len3:1} == ")" ];
+       then
+         #Dest Param is a modRM
+         if [ ${PARAMLIST[1]:0:1} == "(" ];
+         then
+          PARAMLIST[1]="0x0"${PARAMLIST[1]};
+         fi;
+         PARAM_DEST="S_"${PARAMLIST[1]}"_"${PARAMLIST[2]}"_"${PARAMLIST[3]};
+         PARAM_DEST=${PARAM_DEST//(/_};
+         PARAM_DEST=${PARAM_DEST//)/_};
+         PARAM_SRC=${PARAMLIST[0]};
+       else 
+         #Src Param is a modRM
+         if [ ${PARAMLIST[0]:0:1} == "(" ];
+         then
+          PARAMLIST[0]="0x0"${PARAMLIST[0]};
+         fi;
+         PARAM_SRC="S_"${PARAMLIST[0]}"_"${PARAMLIST[1]}"_"${PARAMLIST[2]};
+         PARAM_SRC=${PARAM_SRC//(/_};
+         PARAM_SRC=${PARAM_SRC//)/_};
+         PARAM_DEST=${PARAMLIST[3]};
+        fi;;
+    
+    *) error "disassemble: Unsupported param list size ${#PARAMLIST[@]} : ${PARAMLIST[@]}";;
+    
+    esac
+
+    #Cache the instruction for future use
+    export "INSTRUCTION_$ADDRESS=OPCODE=$OPCODE  PARAM_SRC=$PARAM_SRC PARAM_DEST=$PARAM_DEST LENGTH=$LENGTH";
+    #foo=INSTRUCTION_$ADDRESS; echo ${!foo}
+    NUMBER_DISASSEMBLED=$((NUMBER_DISASSEMBLED+1));
+  fi;
+}
+
+
+##############################################################################
+##Register Functions
+
+
+getRegIndex()  #regstring
+{
+  #return register index
+  #Quicker than doing a looped lookup
+  case $1 in
+  "%eax") echo $R_EAX;;
+  "%ecx") echo $R_ECX;;
+  "%edx") echo $R_EDX;;
+  "%ebx") echo $R_EBX;;
+  "%esp") echo $R_ESP;;
+  "%ebp") echo $R_EBP;;
+  "%esi") echo $R_ESI;;
+  "%edi") echo $R_EDI;;
+  "%al") echo $R_AL;;
+  "%cl") echo $R_CL;;
+  "%dl") echo $R_DL;;
+  "%bl") echo $R_BL;;
+  "%ah") echo $R_AH;;
+  "%ch") echo $R_CH;;
+  "%dh") echo $R_DH;;
+  "%bh") echo $R_BH;;
+  "%ax") echo $R_AX;;
+  "%cx") echo $R_CX;;
+  "%dx") echo $R_DX;;
+  "%bx") echo $R_BX;;
+  "%sp") echo $R_SP;;
+  "%bp") echo $R_BP;;
+  "%si") echo $R_SI;;
+  "%di") echo $R_DI;;
+  "%eiz") echo $R_EIZ;;
+  *) error "getRegIndex: Unsupported Reg: $1";;
+  esac;
+}
+
+getRegVal() #regIndex
+{
+  #return register value
+  INDEX=$1;
+
+  if [ $INDEX -le $R_EDI ];
+  then
+    #32bit registers
+    echo ${REG_VALS[$INDEX]};
+   
+  elif [ $INDEX -le $R_BL ];
+  then
+    #8 bit registers (low)
+    INDEX=$((INDEX-R_AL));
+    echo $((${REG_VALS[$INDEX]} & 0xff ));
+
+  elif [ $INDEX -le $R_BH ];
+  then
+    #8 bit registers (high)
+    INDEX=$((INDEX-R_AH));
+    echo $((${REG_VALS[$INDEX]} & 0xff00 ));
+
+  elif [ $INDEX -le $R_DI ];
+  then
+    #16bit registers
+    INDEX=$((INDEX-R_AX));
+    echo $((${REG_VALS[$INDEX]} & 0xffff ));
+  
+  elif [ $INDEX -le $R_LAZYS ];
+  then
+    #Lazy Registers
+    echo ${REG_VALS[$INDEX]};
+  
+  elif [ $INDEX -eq $R_EIZ ];
+  then
+    #peusdo reg, always zero
+    echo 0;
+    
+  else
+    error "getRegVal: Unsupported Reg: $INDEX";
+    echo 0;
+  fi;
+}
+
+getRegSize() #regIndex
+{
+  #return register size
+  INDEX=$1;
+
+  if [ $INDEX -le $R_EDI ];
+  then
+    #32bit registers
+    echo 4;
+   
+  elif [ $INDEX -le $R_BL ];
+  then
+    #8 bit registers
+    echo 1;
+  elif [ $INDEX -le $R_BH ];
+  then
+    #8 bit registers
+    echo 1;
+  elif [ $INDEX -le $R_DI ];
+  then
+    #16bit registers
+    echo 2;
+
+  elif [ $INDEX -le $R_LAZYS ];
+  then
+    echo 4;
+
+  else
+    error "getRegVal: Unsupported Reg: $INDEX";
+    echo 0;
+  fi;
+}
+
+
+setRegVal() #regIndex, value
+{
+  INDEX=$1;
+  VAL=$2;
+
+  if [ $INDEX -le $R_EDI ];
+  then
+    #32bit registers
+    REG_VALS[$INDEX]=$VAL;
+   
+  elif [ $INDEX -le $R_BL ];
+  then
+    #8 bit (low) registers
+    INDEX=$((INDEX-R_AL));
+    local OLDVAL=${REG_VALS[$INDEX]};
+    #error "setRegVal: Unsupported 8bit Reg: $INDEX $VAL $OLDVAL";
+    REG_VALS[$INDEX]=$(((OLDVAL&0xffffff00)|(VAL&0xff)));
+    
+  elif [ $INDEX -le $R_BH ];
+  then
+    #8 bit (high) registers
+    INDEX=$((INDEX-R_AH));
+    local OLDVAL=${REG_VALS[$INDEX]};
+    #error "setRegVal: Unsupported 8bit Reg: $INDEX $VAL $OLDVAL";
+    REG_VALS[$INDEX]=$(( (OLDVAL&0xffff00ff) | ((VAL&0xff)<<8) ));
+   
+  elif [ $INDEX -le $R_DI ];
+  then
+    #16bit registers
+    INDEX=$((INDEX-R_AX));
+    local OLDVAL=${REG_VALS[$INDEX]};
+    #error "setRegVal: Unsupported 16bit Reg: $INDEX $VAL $OLDVAL";
+    REG_VALS[$INDEX]=$(((OLDVAL&0xffff0000)|(VAL&0xffff)));
+    
+  elif [ $INDEX -le $R_LAZYS ];
+  then
+    #Lazy Registers
+    REG_VALS[$INDEX]=$VAL;
+
+  else
+    error "setRegVal: Unsupported Reg: $INDEX";
+  fi;
+}
+
+
+##############################################################################
+##get/set Parameters
+##Parameters are strings like "esp" "(eax)" "0x345677"
+
+getV() #parameter
+{
+  #Note: will not load from a memory address
+  TOGET="$1";
+  
+  case $TOGET in
+  
+  #Register
+  "%"*) REG=$(getRegIndex "$TOGET");
+        VAL=$(getRegVal $REG);;
+  
+  #Value
+  "$"*) VAL=${TOGET:1};
+        VAL=$((VAL));;
+
+  #Memory Location
+  "0x"*) local LEN=$((${#TOGET}-1));
+         if [ ${TOGET:LEN} == ")" ];
+         then
+           #Woo. We have a 0x123(%eax) type thing
+           TOGET=${TOGET//(/ };
+           TOGET=${TOGET//)/ };
+           TOGET=( $TOGET );
+           local DISPLACEMENT=$(signedInt ${TOGET[0]});
+           local BASE=$(getV ${TOGET[1]});
+           local LOC=$((BASE+DISPLACEMENT));
+           #echo "$LOC from $DISPLACEMENT and $BASE" >&2;
+           VAL=$LOC;
+         else
+           #We have a 0x12345 type thing
+           VAL=$((TOGET));
+         fi;;
+
+  #Special [eg S 0xfffffffe(%ecx %edx 1) ]  #WILL THIS BREAK WITH NULL FIELDS????
+  "S"*) local OLDIFS="$IFS";
+        IFS="_"
+        MODRM=( $TOGET );
+        IFS=" ";
+        local DISPLACEMENT=$(signedInt ${MODRM[1]});
+        local BASE=$(getV ${MODRM[2]});
+        local INDEX=$(getV ${MODRM[3]});
+        local SCALE=${MODRM[4]};
+        VAL=$((BASE+(INDEX*SCALE)+DISPLACEMENT));;
+        #echo "$VAL from $DISPLACEMENT and $BASE and $INDEX and $SCALE" >&2;;
+  
+  #Call location (address)
+  0*|1*|2*|3*|4*|5*|6*|7*|8*|9*) VAL=$(echo 0x$TOGET);;
+
+  #Call location (address from register)
+  "*%"*) local LEN=${#TOGET};
+         local LOC=$(getRegIndex ${TOGET:1:LEN-1} );
+         VAL=$(getRegVal $LOC );;
+
+  #Allowing null values...
+  "") VAL=0;;
+  
+  #Other
+  *) error "getV: Unsupported: $TOGET";
+     VAL=0;;
+  
+  esac
+  echo $VAL;
+  
+}
+
+loadV() #parameter, [size]
+{
+  #Note: might load from a memory address
+  local TOGET="$1";
+  local SIZE=${2:-4}; #defaults to 4
+  local VAL=0;
+
+  case $TOGET in
+  
+  #Register
+  "%"*) local REG=$(getRegIndex "$TOGET");
+        VAL=$(getRegVal $REG);;
+  
+  #Value
+  "$"*) VAL=${TOGET:1};
+        VAL=$((VAL));;
+  
+  #Memory Location
+  "0x"*) local LEN=$((${#TOGET}-1));
+         if [ ${TOGET:LEN} == ")" ];
+         then
+           #Woo. We have a 0x123(%eax) type thing
+           TOGET=${TOGET//(/ };
+           TOGET=${TOGET//)/ };
+           TOGET=( $TOGET );
+           local DISPLACEMENT=$(signedInt ${TOGET[0]});
+           local BASE=$(getV ${TOGET[1]});
+           local LOC=$((BASE+DISPLACEMENT));
+           #echo "$LOC from $DISPLACEMENT and $BASE" >&2;
+           getValuesFromMemory $LOC $SIZE;
+           VAL=$MEMORYVALUE;
+         else
+           #We have a 0x12345 type thing
+           getValuesFromMemory $((TOGET)) $SIZE;
+           VAL=$MEMORYVALUE
+         fi;;
+  
+  #Memory location gotten from register value
+  "(%"*) local LEN=${#TOGET};
+         local LOC=$(getRegIndex ${TOGET:1:LEN-2} );
+         LOC=$(getRegVal $LOC );
+         getValuesFromMemory $LOC $SIZE;
+         VAL=$((MEMORYVALUE));;
+
+  #Special [eg S 0xfffffffe(%ecx %edx 1) ]  #WILL THIS BREAK WITH NULL FIELDS????
+  "S"*) local OLDIFS="$IFS";
+        IFS="_"
+        MODRM=( $TOGET );
+        IFS=" ";
+        local DISPLACEMENT=$(signedInt ${MODRM[1]});
+        local BASE=$(getV ${MODRM[2]});
+        local INDEX=$(getV ${MODRM[3]});
+        local SCALE=${MODRM[4]};
+        VAL=$((BASE+(INDEX*SCALE)+DISPLACEMENT));
+        #echo "$VAL from $DISPLACEMENT and $BASE and $INDEX and $SCALE" >&2;
+        getValuesFromMemory $VAL $SIZE;
+        VAL=$MEMORYVALUE;;
+  
+  #Other
+  *) error "loadV: Unsupported: $TOGET";
+     VAL=0;;
+  
+  esac
+  echo $VAL;
+  
+}
+
+setV() #parameter,value,size
+{
+  #Note: might store to a memory address
+  TOSET="$1";
+  VAL=$2;
+  SIZE=$3
+  #echo "setV: Setting: $TOSET $VAL $SIZE";
+  
+  case $TOSET in
+  
+  #Register
+  "%"*) REG=$(getRegIndex $TOSET);
+        setRegVal $REG $VAL;;
+  
+  #Memory location gotten from register value
+  "(%"*) LEN=${#TOSET};
+         LOC=$(getRegIndex ${TOSET:1:LEN-2} );
+         LOC=$(getRegVal $LOC );
+         setValueToMemory $LOC $SIZE $VAL;;
+  
+  #Special [eg S 0xfffffffe(%ecx %edx 1) ]  #WILL THIS BREAK WITH NULL FIELDS????
+  "S"*) local OLDIFS="$IFS";
+        IFS="_"
+        MODRM=( $TOSET );
+        IFS=" ";
+        local DISPLACEMENT=$(signedInt ${MODRM[1]});
+        local BASE=$(getV ${MODRM[2]});
+        local INDEX=$(getV ${MODRM[3]});
+        local SCALE=${MODRM[4]};
+        local LOC=$((BASE+(INDEX*SCALE)+DISPLACEMENT));
+        #echo "$LOC from $DISPLACEMENT and $BASE and $INDEX and $SCALE" >&2;
+        setValueToMemory $LOC $SIZE $VAL;;
+  
+  #Memory Location
+  "0x"*) local LEN=$((${#TOSET}-1));
+         if [ ${TOSET:LEN} == ")" ];
+         then
+           #Woo. We have a 0x123(%eax) type thing
+           TOSET=${TOSET//(/ };
+           TOSET=${TOSET//)/ };
+           TOSET=( $TOSET );
+           local DISPLACEMENT=$(signedInt ${TOSET[0]});
+           local BASE=$(getV ${TOSET[1]});
+           local LOC=$((BASE+DISPLACEMENT));
+           #echo "$LOC from $DISPLACEMENT and $BASE" >&2;
+           setValueToMemory $LOC $SIZE $VAL;
+         else
+           #We have a 0x12345 type thing
+           setValueToMemory $TOSET $SIZE $VAL;
+         fi;;
+  
+  #Other
+  *) error "setV: Unsupported: $TOSET $VAL $SIZE";;
+  
+  esac
+}
+
+getVSize() #parameterSrc, parameterDest
+{
+  #Returns size
+  #Figures out what size the operation is
+  local SRC="$1";
+  local DEST="$2";
+  local SIZE=4;
+  
+  case $DEST in
+  "%"*) #error "REGIS?TER DEST";
+    local REG=$(getRegIndex "$DEST");
+    local SIZETEMP=$(getRegSize $REG);
+    if [ $SIZETEMP -lt 4 ];
+    then
+      SIZE=$SIZETEMP;
+    fi;;
+  esac
+  
+  case $SRC in
+  "%"*)   #error "REGIS?TER SRC";
+    local REG=$(getRegIndex "$SRC");
+    local SIZETEMP=$(getRegSize $REG);
+    if [ $SIZETEMP -lt $SIZE ];
+    then
+      SIZE=$SIZETEMP;
+    fi;;
+  esac
+
+  echo $SIZE;
+}
+
+
+##############################################################################
+##Lazy Flagging
+
+setLazyFlags() # Opcode, Res, Dest, Src
+{
+  #Currently only sets flags for sub (?)
+  
+  setRegVal $R_LAZYOP $1;
+  setRegVal $R_LAZYD $3;
+  setRegVal $R_LAZYS $4;
+  setRegVal $R_LAZYR $2;
+}
+
+getLazyFlags() #??
+{
+  error "getLazyFlags: I don't do anything yet";
+}
+
+
+##############################################################################
+##System calls
+
+
+callsyscall() #none
+{
+  CALL=$(getRegVal $R_EAX);
+  local SYSCALL_RESULT=0;
+  
+  case $((CALL)) in
+  
+  #exit
+  1) STRACE exit 1 "=0\n";
+     exitTranslator;;
+  
+  #write
+  4) STRACE write 3;
+     getValuesFromMemoryAsAscii $(getRegVal $R_ECX) $(getRegVal $R_EDX);;
+
+  #getpid
+  20) STRACE getpid 0;
+      SYSCALL_RESULT=$$;;
+    
+  #getuid
+  24) STRACE getuid 0;
+      SYSCALL_RESULT=$UID;;
+  
+  #getgid
+  45) STRACE brk 1;
+      local PARAM1=$(getRegVal $R_EBX);
+      if [ $PARAM1 -eq 0 ];
+      then
+        SYSCALL_RESULT=$BRKVAL;
+      else
+        SYSCALL_RESULT=$PARAM1;
+        PARAM1=$(( (((PARAM1-1) & 0xfffff000) | 0xfff) + 1 ));
+        BRKVAL=$PARAM1;
+        changeMemoryLocationSize $INITIAL_BRKVAL $((PARAM1-INITIAL_BRKVAL));
+      fi;;
+        
+  #getgid
+  47) STRACE getgid 0;
+      SYSCALL_RESULT=$GROUPS;;
+      
+  #geteuid
+  49) STRACE geteuid 0;
+      SYSCALL_RESULT=$EUID;;
+  
+  #getegid
+  50) STRACE getegid 0 "[not quite correct]";
+      SYSCALL_RESULT=$GROUPS;;
+  
+  #fcntl
+  55) STRACE fcntl 3 "[Always returning 0]";;
+  
+  #uname
+  122) STRACE uname 1;
+       structUtsname=$(getRegVal $R_EBX);
+       #struct utsname { char sysname[65]; char nodename[65]; char release[65]; char version[65]; char machine[65]; char domainname[65]; };
+       error "Unimplemented syscall uname($structUtsname). It needs to fill in from $structUtsname to $((structUtsname+390))";;
+  
+  #personality
+  136) STRACE personality 1 "[Doing nothing]";; #return 0, therefore do nothing!
+  
+  #Unknown
+  *) errorF "Unknown syscall $CALL($(getRegVal $R_EBX),$(getRegVal $R_ECX),$(getRegVal $R_EDX),$(getRegVal $R_ESI),$(getRegVal $R_EDI),$(getRegVal $R_EBP) )";;
+
+  esac
+
+  #Set the result;
+  setRegVal $R_EAX $SYSCALL_RESULT;
+  STRACERESULT $SYSCALL_RESULT;
+}
+
+
+##############################################################################
+##Perform Instruction
+
+Opcode_and()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D & VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_add()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D + VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_addl()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D + VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_call()
+{
+  VAL_S=$(getV "$PARAM_SRC");
+  setNextInstruction $VAL_S;
+  local NEWSP=$(($(getRegVal $R_ESP) - 0x4 ));
+  setRegVal $R_ESP $NEWSP;
+  setV "(%esp)" $((ADDRESS+LENGTH)) 4;
+}
+
+Opcode_cld()
+{  
+  #Clear DF in the Eflags...Do nothing for now
+  return;
+}
+
+Opcode_cmp()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D-VAL_S));
+}
+
+Opcode_cmpl()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D-VAL_S));
+}
+
+Opcode_cmpb()
+{
+  VAL_D=$(loadV "$PARAM_DEST" 1);
+  VAL_S=$(loadV "$PARAM_SRC" 1);
+  VAL_RES=$((VAL_D-VAL_S));
+}
+
+Opcode_dec()
+{
+  VAL_D=$(loadV "$PARAM_SRC");
+  VAL_S=0;
+  VAL_RES=$(($VAL_D-1));
+  setV "$PARAM_SRC" $VAL_RES 4;
+}
+
+Opcode_fldcw()
+{
+  return;
+}
+
+Opcode_fnstcw()
+{
+  #Ouch! Store the FP Control Word. Store 0 for now!
+  setV "$PARAM_SRC" 0 2;
+}
+
+Opcode_inc()
+{
+  VAL_D=$(loadV "$PARAM_SRC");
+  VAL_S=1;
+  VAL_RES=$((VAL_D+VAL_S));
+  setV "$PARAM_SRC" $VAL_RES 4;
+}
+
+Opcode_incl()
+{
+  VAL_D=$(loadV "$PARAM_SRC");
+  VAL_S=1;
+  VAL_RES=$((VAL_D+VAL_S));
+  setV "$PARAM_SRC" $VAL_RES 4;
+}
+
+Opcode_int()
+{  
+  if [ $(getV "$PARAM_SRC") == 128 ]
+  then
+    callsyscall;
+  else
+    error "Opcode_int: Unknown int parameter "$PARAM_SRC"";
+  fi;
+}
+
+Opcode_ja()
+{
+  #Unsigned version of jg
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -gt 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jae()
+{
+  #Unsigned version of jge
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -ge 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jb()
+{
+  #Unsigned version of jl
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -lt 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jbe()
+{  
+  #Unsigned version of jle
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -le 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_je()
+{
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -eq 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jg()
+{
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -gt 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jge()
+{ 
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -ge 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jl()
+{
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -lt 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jle()
+{  
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -le 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_jmp()
+{  
+  setNextInstruction $(getV "$PARAM_SRC");
+}
+
+Opcode_jne()
+{ 
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -ne 0 ];
+  then
+    setNextInstruction $(getV "$PARAM_SRC");
+  fi;
+}
+
+Opcode_lea()
+{
+  setV "$PARAM_DEST" $(getV "$PARAM_SRC") 4;
+}
+
+Opcode_leave()
+{
+  #Copy EBP into ESP. Then Pop stack into EBP
+  local OLDEBP=$(($(getRegVal $R_EBP) ));
+          
+  #Ouch! I don't like using getValuesFromMemory here. Should use: $(( $(loadV $OLDEBP) ));
+  getValuesFromMemory $((OLDEBP)) 4;
+  local NEWEBP=$MEMORYVALUE;
+
+  setRegVal $R_ESP $((OLDEBP + 4));
+  setRegVal $R_EBP $NEWEBP;
+}
+
+Opcode_les()
+{
+  #Until segment registers are supported, this is just a mov
+  local SIZE=$(getVSize "$PARAM_SRC" "$PARAM_DEST" );
+  setV "$PARAM_DEST" $(loadV "$PARAM_SRC" $SIZE) $SIZE;
+}
+
+Opcode_mov()
+{
+  local SIZE=$(getVSize "$PARAM_SRC" "$PARAM_DEST" );
+  setV "$PARAM_DEST" $(loadV "$PARAM_SRC" $SIZE) $SIZE;
+}
+
+Opcode_movb()
+{
+  setV "$PARAM_DEST" $(loadV "$PARAM_SRC" 2) 2;
+}
+
+Opcode_movl()
+{
+  setV "$PARAM_DEST" $(loadV "$PARAM_SRC" 4) 4;
+}
+
+Opcode_movsbl()
+{
+  debug "movsbl";
+  exit;
+  #setV "$PARAM_DEST" $(loadV "$PARAM_SRC" 4) 4;
+}
+
+Opcode_movzbl()
+{
+  #Expands a single byte to 32 bits, zero extended
+  VAL_S=$(loadV "$PARAM_SRC" 1);
+  setV "$PARAM_DEST" $((VAL_S & 0x000000ff)) 4;
+}
+
+Opcode_movzbw()
+{
+  #Expands a single byte to 16 bits, zero extended
+  VAL_S=$(loadV "$PARAM_SRC" 1);
+  setV "$PARAM_DEST" $((VAL_S & 0x000000ff)) 2;
+}
+
+Opcode_movzwl()
+{
+  #Expands a single word to 32 bits, zero extended
+  VAL_S=$(loadV "$PARAM_SRC" 2);
+  setV "$PARAM_DEST" $((VAL_S & 0x0000ffff)) 4;
+}
+
+Opcode_mul()
+{
+  #Implied dest is Eax/ax/al
+  VAL_D=$(getRegVal $R_EAX);
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D * VAL_S));
+  setRegVal $R_EAX $VAL_RES 4;
+}
+
+Opcode_nop()
+{
+  return;
+}
+
+Opcode_not()
+{  
+  VAL_D=$(loadV "$PARAM_SRC");
+  VAL_S=0;
+  VAL_RES=$((~$(signedInt $VAL_D)));
+  setV "$PARAM_SRC" $VAL_RES 4;
+}
+
+Opcode_or()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D | VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_push()
+{
+  #sub 4 from the stack, then set val onto the stack
+  VAL_S=$(loadV "$PARAM_SRC");
+  local NEWSP=$(($(getRegVal $R_ESP) - 0x4 ));
+  setRegVal $R_ESP $NEWSP;
+  setV "(%esp)" $VAL_S 4;
+}
+
+Opcode_pushl()
+{
+  #sub 4 from the stack, then set val onto the stack
+  VAL_S=$(loadV "$PARAM_SRC");
+  local NEWSP=$(($(getRegVal $R_ESP) - 0x4 ));
+  setRegVal $R_ESP $NEWSP;
+  setV "(%esp)" $VAL_S 4;
+}
+
+Opcode_pop()
+{         
+  #Get value off the stack, then add 4 to the stack
+  local STACKVAL=$(( $(loadV '(%esp)') ));
+  setV "$PARAM_SRC" $STACKVAL 4;
+  local NEWSP=$(($(getRegVal $R_ESP) + 0x4 ));
+  setRegVal $R_ESP $NEWSP;
+}
+
+Opcode_repnzscas()
+{
+  #scas: compare DEST and SRC, setting status flags. EDI+=sizeofDEST
+  #repnz: LOOP scas; ecx--; if( ecx==0 or ZF==1) then exit; DONE
+  
+  local SIZE=$(getVSize "%edi" "$PARAM_DEST" );
+  VAL_D=$(loadV "$PARAM_DEST");
+  #SCAS always uses ES:EDI. So lets hardcode shortcuts. gah! Also, ES not yet supported.
+    VAL_S_ADDR=$(getRegVal $R_EDI); #VAL_S_ADDR=$(getV "$PARAM_SRC");
+  local COUNTDOWN=$(getRegVal $R_ECX);
+  local DI_OFFSET=0;
+  local LOOP=;
+  while [ ! $LOOP ];
+  do
+    #debug "repnz scas: [ size=$SIZE VAL_D=$VAL_D VAL_S_ADDR=$VAL_S_ADDR ] COUNTDOWN=$COUNTDOWN DI_OFFSET=$DI_OFFSET";
+    getValuesFromMemory $((VAL_S_ADDR + DI_OFFSET)) $SIZE;
+    
+    COUNTDOWN=$((COUNTDOWN-1));
+    DI_OFFSET=$((DI_OFFSET+SIZE));
+    
+    if [ $MEMORYVALUE -eq $VAL_D -o $COUNTDOWN -eq 0 ];
+    then
+      LOOP=1;
+    fi;
+  done;
+  setRegVal $R_ECX $COUNTDOWN;
+  setRegVal $R_EDI $((VAL_S_ADDR+DI_OFFSET));
+}
+
+Opcode_repzmovsl()
+{
+  #movsl: move SRC (ds:esi) to DEST (es:edi).  EDI+=sizeofDEST.  ESI+=sizeofSRC (note: ZF not effected)
+  #repz: LOOP movsl; ecx--;  if( ecx==0 or ZF==0) then exit; DONE
+  
+  #movsl always uses ES:EDI and DS:ESI. So lets hardcode shortcuts. Also, ES and DS not yet supported.
+  VAL_S_ADDR=$(getRegVal $R_ESI); #VAL_S_ADDR=$(getV "$PARAM_SRC");
+  VAL_D_ADDR=$(getRegVal $R_EDI); #VAL_S_ADDR=$(getV "$PARAM_DEST");
+  local COUNTDOWN=$(getRegVal $R_ECX);
+  local OFFSET=0;
+  local LOOP=;
+  while [ ! $LOOP ];
+  do
+    #debug "repnz movsl: [ VAL_D_ADDR=$VAL_D_ADDR VAL_S_ADDR=$VAL_S_ADDR ] COUNTDOWN=$COUNTDOWN OFFSET=$OFFSET";
+    
+    getValuesFromMemory $((VAL_S_ADDR + OFFSET)) 4;
+    setValueToMemory $((VAL_D_ADDR + OFFSET)) 4 $MEMORYVALUE;
+    
+    COUNTDOWN=$((COUNTDOWN-1));
+    OFFSET=$((OFFSET+4));
+    
+    if [ $COUNTDOWN -eq 0 ];
+    then
+      LOOP=1;
+    fi;
+  done;
+  setRegVal $R_ECX $COUNTDOWN;
+  setRegVal $R_ESI $((VAL_S_ADDR+OFFSET));
+  setRegVal $R_EDI $((VAL_D_ADDR+OFFSET));
+}
+
+Opcode_ret()
+{         
+  local RETTO=$(( $(loadV '(%esp)') ));
+  setNextInstruction $RETTO;
+  local NEWSP=$(($(getRegVal $R_ESP) + 0x4 ));
+  setRegVal $R_ESP $NEWSP;
+}
+
+Opcode_rorb()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+          
+  VAL_RES=$((  0xff & (VAL_D<<(8-VAL_S)) ));
+  VAL_RES=$(( (VAL_D>>VAL_S) | VAL_RES ));
+  setV "$PARAM_DEST" $VAL_RES 1;
+}
+
+Opcode_sar()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  if [ $VAL_D -ne $(signedInt $VAL_D) ];
+  then
+    errorF "sar: signed values not yet supported. $VAL_D $(signedInt $VAL_D)";
+  fi;
+  VAL_RES=$((VAL_D >> VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_sete()
+{
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -eq 0 ];
+  then
+    setV "$PARAM_SRC" 1 1;
+  fi;
+}
+
+Opcode_setne()
+{
+  #To do: use getLazyFlag!
+  if [ $(getRegVal $R_LAZYR) -ne 0 ];
+  then
+    setV "$PARAM_SRC" 1 1;
+  fi;
+}
+
+Opcode_shl()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D << VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_shll()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D << VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_shr()
+{          
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D >> VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_shrl()
+{          
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D >> VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_sub()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D - VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+}
+
+Opcode_test()
+{         
+  #Do an AND, but don't store the result
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D & VAL_S));
+}
+
+Opcode_testb()
+{         
+  #Do an AND, but don't store the result
+  VAL_D=$(loadV "$PARAM_DEST" 1);
+  VAL_S=$(loadV "$PARAM_SRC" 1);
+  VAL_RES=$((VAL_D & VAL_S));
+}
+
+Opcode_xor()
+{
+  VAL_D=$(loadV "$PARAM_DEST");
+  VAL_S=$(loadV "$PARAM_SRC");
+  VAL_RES=$((VAL_D ^ VAL_S));
+  setV "$PARAM_DEST" $VAL_RES 4;
+  #export "INSTRUCTION_$ADDRESS=OPCODE=eval PARAM_DEST=\"setV "$PARAM_DEST" \$((\$(loadV "$PARAM_DEST") ^ \$(loadV "$PARAM_SRC"))) 4\"";
+}
+
+
+performInstruction() #none
+{
+  VAL_RES=;
+
+  ##To do - Sort out the size's to setV. Don't just use 4
+
+  Opcode_$OPCODE;
+
+  ##WARNING! Only set val res if you want lazy flags setting
+  if [ $VAL_RES ];
+  then
+    setLazyFlags $OPCODE $VAL_RES $VAL_D $VAL_S
+  fi;
+}
+
+
+##############################################################################
+##GO!
+
+run $@;

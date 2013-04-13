@@ -1,0 +1,338 @@
+#!/bin/bash
+##########################################################################
+#
+# mupi memory address functions
+#
+# By Alan Hayward, 2006
+#
+# Internal mpui functions. Do not run directly
+#
+##########################################################################
+
+echo "Internal mpui functions. Do not run directly";
+
+
+##############################################################################
+##Virtual Memory Address Space Support
+
+MEMLIST=();
+T_FILE=0;
+T_MEM=1;
+
+findMemoryLocation() #address
+{
+  #Returns Type, filename/addressVariable, Offset
+  local TOFIND=$1;
+  local COUNT=0;
+
+  while [ $COUNT -lt ${#MEMLIST[@]} ];
+  do
+    #echo ${MEMLIST[$COUNT]};
+    local ${MEMLIST[$COUNT]};
+    
+    if [ $((TOFIND)) -ge $((MEMLOC)) -a $((TOFIND)) -le $((MEMLOC+SIZE)) ];
+    then
+      if [ $TYPE -eq $T_FILE ];
+      then
+        echo $T_FILE $FNAME $((TOFIND-MEMLOC+FOFFSET));
+        return;
+      else
+        echo $T_MEM MEMORY_$MEMLOC $((TOFIND-MEMLOC));
+        return;
+      fi;
+    fi;
+  
+    COUNT=$((COUNT+1));
+  done;
+  errorF "findMemoryLocation: Couldn't find: $TOFIND (Should support new mem locations???)";
+}
+
+
+addMemoryLocation() #address, size, type, filename, fileoffset
+{
+  local COUNT=${#MEMLIST[@]};
+  MEMLIST[$COUNT]="MEMLOC=$1 SIZE=$2 TYPE=$3  FNAME=$4 FOFFSET=$5";
+  #error ${MEMLIST[$COUNT]};
+}
+
+
+changeMemoryLocationSize() #address, newsize
+{
+  local TOFIND=$1;
+  local NEWSIZE=$2;
+  local COUNT=0;
+
+  while [ $COUNT -lt ${#MEMLIST[@]} ];
+  do
+    #echo ${MEMLIST[$COUNT]};
+    local ${MEMLIST[$COUNT]};
+    
+    if [ $((TOFIND)) -eq $((MEMLOC)) ];
+    then
+      #error "changeMemoryLocationSize: Found ${MEMLIST[$COUNT]}";
+      MEMLIST[$COUNT]="MEMLOC=$MEMLOC SIZE=$NEWSIZE TYPE=$TYPE  FNAME=$FNAME FOFFSET=$FOFFSET";
+      #error "changeMemoryLocationSize: Now ${MEMLIST[$COUNT]}";
+      return;
+    fi;
+  
+    COUNT=$((COUNT+1));
+  done;
+  errorF "changeMemoryLocationSize: Couldn't find: $TOFIND";
+}
+
+
+##############################################################################
+##Memory accesses
+
+#Would we solve lots of pain by using 8bit mem values, instead of 32bit ?
+#accessing 32bit is fine
+#accessing 8bit and 16bit is a pain
+#accessing unaligned 8bit is a real pain
+#accessing unaligned 16bit and 32bit is a complete nightmare
+
+INITTOZERO=1;
+
+RAW_getValuesFromMemoryAndCache() #address,initToZero
+{
+  #Assumes size 4 and aligned
+  #sets $MEMORYVALUE, and cache's if need be.
+  local ADDR=$1; 
+  local INIT=$2; 
+
+  local MEMORYVAR=MEMORY_$ADDR;
+  local MEMVAL=${!MEMORYVAR};
+  if [ $MEMVAL ]
+  then
+    #The memory location exists. Use it!
+    #echo "RAW_getValuesFromMemoryAndCache: Found Mem Value $MEMVAL at $MEMORYVAR" >&2;
+    MEMORYVALUE=$MEMVAL;
+  
+  else
+    #Memory location doesn't exist. Load it from the address space
+    
+    local FOUND;
+    FOUND=( $(findMemoryLocation $ADDR) );
+    #echo ${FOUND[@]} >&2;
+
+    if [ ${FOUND[0]} -eq $T_FILE ];
+    then
+      #File based memory location
+      export "MEMORY_$ADDR=0x"$(hexdump -s ${FOUND[2]} -n 4 -v -e '"%08x"' ${FOUND[1]});
+      #echo ${!MEMORYVAR} >&2;
+      MEMORYVALUE=${!MEMORYVAR}; #echo ${!MEMORYVAR};
+    else
+      #Memory bases memory location
+      #Could I just set the value to 0 ? should we ever really encounter this?
+      #Yes we will get this! for example the bss section is initialised to 0.
+      #But this could be useful for finding bugs(?)
+      #if [ ! $INIT ];
+      #then
+      #  error "RAW_getValuesFromMemoryAndCache: Memory based memory that's not from a file shouldn't be supported(?) ADDR=$ADDR";
+      #fi;
+      export "MEMORY_$ADDR=0x00000000";
+      MEMORYVALUE=${!MEMORYVAR}; #echo ${!MEMORYVAR};
+    fi;
+  fi;
+}
+
+
+getValuesFromMemory() #address,length,initToZero
+{
+  #Sets $MEMORYVALUE to be the value from the address 
+
+  #Note: Simplying echoing the value, so that you can call $(getValuesFromMemory ...) messes up the caching.
+  
+  local ADDR=$1;
+  local MEMLEN=$2;
+  local INIT=$3; 
+  #echo "getValuesFromMemory $ADDR" >&2;
+
+  if [ $ADDR -ne $((ADDR&0xfffffffc)) ];
+  then
+    #Unaligned values
+        
+    local ALIGNOUT=$((ADDR&0x3));
+    local AIGNEDMEM=$((ADDR&0xfffffffc));
+    case $MEMLEN in
+  
+     1) #The 8bit value will always reside in one 32bit chunk        
+        RAW_getValuesFromMemoryAndCache $AIGNEDMEM $INIT;
+        MEMORYVALUE=$(( (MEMORYVALUE >> ${SHIFT[$ALIGNOUT]}) & 0xff ));;
+      
+     2) case $ALIGNOUT in
+     
+         1|2) #The 16bit value resides in one 32bit chunk
+              RAW_getValuesFromMemoryAndCache $AIGNEDMEM $INIT;
+              MEMORYVALUE=$(( (MEMORYVALUE >> ${SHIFT[$ALIGNOUT]}) & 0xffff ));;
+        
+         *) error "getValuesFromMemory: Length $MEMLEN not supported for unaligned access $ADDR (out by $ALIGNOUT)";;
+
+         esac;;
+     
+     4) RAW_getValuesFromMemoryAndCache $AIGNEDMEM $INIT;
+        local LOW=$(( (MEMORYVALUE >> ${SHIFT[$ALIGNOUT]}) & ${CHOP[4-ALIGNOUT]} ));
+        RAW_getValuesFromMemoryAndCache $((AIGNEDMEM+4)) $INIT;
+        local HIGH=$(( (MEMORYVALUE & ${CHOP[$ALIGNOUT]}) << ${SHIFT[4-ALIGNOUT]} ));
+        MEMORYVALUE=$((HIGH|LOW));;
+        #debug "getValuesFromMemory: HIGH=$HIGH LOW=$LOW MEMORYVALUE=$MEMORYVALUE";;
+        
+     *) error "getValuesFromMemory: Length $MEMLEN not supported for unaligned access $ADDR (out by $ALIGNOUT).";
+        MEMORYVALUE=0;;
+
+    esac
+    
+  else
+    #Aligned values
+    
+    RAW_getValuesFromMemoryAndCache $ADDR $INIT;
+    
+    #chop to correct size
+    case $MEMLEN in
+     2) MEMORYVALUE=$((MEMORYVALUE&0x0000ffff));;
+     1) MEMORYVALUE=$((MEMORYVALUE&0x000000ff));;
+    esac
+    
+    if [ "$BYTESWAP" -eq 1 ];
+    then
+      #WRONG WRONG WRONG!!! ASSUME HEX!!!
+      #echo "SAWP" $MEMORYVALUE
+      MEMORYVALUE=${MEMORYVALUE:0:2}${MEMORYVALUE:8:2}${MEMORYVALUE:6:2}${MEMORYVALUE:4:2}${MEMORYVALUE:2:2}
+      #echo "SAWP" $MEMORYVALUE
+
+    fi;
+      
+  fi;
+}
+
+
+getValuesFromMemoryAsAscii() #address,length
+{
+  #Returns a nice string
+  
+  #To do: Will break on unaligned accesses
+  #To do: Will round up lengths to multiples of 4
+  
+  local ADDR=$(($1));
+  local MEMLEN=$(($2)); 
+  local RETSTRING;
+  #echo "getValuesFromMemoryAsAscii: $ADDR $MEMLEN" >&2;
+
+  local I=0;
+  while [ $((I*4)) -lt $MEMLEN ];
+  do
+    getValuesFromMemory $ADDR 4;
+    #echo "getValuesFromMemoryAsAscii: $ADDR ($I)= $MEMORYVALUE" >&2;
+    MEMORYVALUE=$(printf "0x%08x" $((MEMORYVALUE)) );
+    
+    #Speed gain lost if byteswapping
+    if [ "$BYTESWAP" -eq 0 ];
+    then
+      getascii  0x${MEMORYVALUE:8:2} 0x${MEMORYVALUE:6:2} 0x${MEMORYVALUE:4:2} 0x${MEMORYVALUE:2:2}
+    else
+      getascii  0x${MEMORYVALUE:2:2} 0x${MEMORYVALUE:4:2} 0x${MEMORYVALUE:6:2} 0x${MEMORYVALUE:8:2}
+    fi;
+    I=$((I+1));
+    ADDR=$((ADDR+4));
+  done;
+}
+
+setValueToMemory() #address,length,value
+{
+  local ADDR=$1;
+  ADDR=$((ADDR+0));
+  local MEMLEN=$2;     
+  local MEMVAL=$3;
+  #debug "setValueToMemory: Addr=$ADDR  Length=$MEMLEN Value=$MEMVAL";
+  
+  if [ $ADDR -ne $((ADDR&0xfffffffc)) ];
+  then
+    
+    local ALIGNOUT=$((ADDR&0x3));
+    local AIGNEDMEM=$((ADDR&0xfffffffc));
+    case $MEMLEN in
+  
+     4) error "setValueToMemory: Length $MEMLEN not supported for unaligned access $ADDR (out by $ALIGNOUT).";;
+
+     2) case $ALIGNOUT in
+     
+        2) #The 16bit value resides in one 32bit chunk
+           RAW_getValuesFromMemoryAndCache $AIGNEDMEM $INITTOZERO;
+           local NEWVAL=$((MEMORYVALUE & 0xffff0000 ));
+           NEWVAL=$((NEWVAL |(MEMVAL<<16) ));
+           export MEMORY_$AIGNEDMEM=$NEWVAL;;
+           #error "setValueToMemory: Length $MEMLEN not supported for unaligned access $ADDR (out by $ALIGNOUT)";;
+        
+        *) error "setValueToMemory: Length $MEMLEN not supported for unaligned access $ADDR (out by $ALIGNOUT)";;
+
+        esac;;
+     
+     1) #The 8bit value will always reside in one 32bit chunk
+        MASK=(0xffffff00 0xffff00ff 0xff00ffff 0x00ffffff);
+        RAW_getValuesFromMemoryAndCache $AIGNEDMEM $INITTOZERO;
+        #echo $MEMORYVALUE >&2;
+        local NEWVAL=$((MEMORYVALUE & ${MASK[$ALIGNOUT]} ));
+        #echo $(($MEMVAL<<${SHIFT[$ALIGNOUT]})) >&2;
+        NEWVAL=$((NEWVAL |(MEMVAL<<${SHIFT[$ALIGNOUT]}) ));
+        #echo $NEWVAL >&2;
+        export MEMORY_$AIGNEDMEM=$NEWVAL;;
+
+     *) error "setValueToMemory: Length $MEMLEN not supported for unaligned accesses $ADDR (out by $ALIGNOUT).";;
+    esac
+  
+    #local foo=MEMORY_$AIGNEDMEM;
+    #echo "setValueToMemory: Set $foo to ${!foo}" >&2;
+  else
+  
+    case $MEMLEN in
+  
+    4) let MEMORY_$ADDR=$MEMVAL;;
+
+    2) RAW_getValuesFromMemoryAndCache $ADDR $INITTOZERO;
+       local NEWVAL=$((MEMORYVALUE & 0xffff0000));
+       NEWVAL=$((NEWVAL | MEMVAL));
+       export MEMORY_$ADDR=$NEWVAL;;
+
+    1) RAW_getValuesFromMemoryAndCache $ADDR $INITTOZERO;
+       local NEWVAL=$((MEMORYVALUE & 0xffffff00));
+       NEWVAL=$((NEWVAL | MEMVAL));
+       export MEMORY_$ADDR=$NEWVAL;;
+
+    *) error "setValueToMemory: Length $MEMLEN not supported.";;
+    esac
+    
+    #local foo=MEMORY_$ADDR;
+    #echo "setValueToMemory: Set $foo to ${!foo}" >&2;
+  fi;
+  
+ 
+}
+
+setValuesToMemoryAsAscii() #address,string
+{
+  #Sets a string to memory
+  
+  #In progress. Currently broken.
+  
+  #To do: Will break on unaligned accesses
+  #To do: Will round up lengths to multiples of 4
+  
+  local ADDR=$(($1));
+  local MEMSTR=$2; 
+
+  #debug "setValuesToMemoryAsAscii: Addr=$ADDR  string=$MEMSTR";
+
+  #Turn into ascii
+  MEMVAL=( $(echo $MEMSTR | hexdump -v -e '"0x%08x "') );
+  
+  #debug "setValuesToMemoryAsAscii: $ADDR $MEMSTR ${MEMVAL[@]}";
+
+  local I=0;
+  while [ $I -lt ${#MEMVAL[@]} ];
+  do
+    setValueToMemory $ADDR 4 ${MEMVAL[I]};
+    #debug "setValuesToMemoryAsAscii: $ADDR ($I)= ${MEMVAL[I]}";
+    I=$((I+1));
+    ADDR=$((ADDR+4));
+  done;
+}
+
